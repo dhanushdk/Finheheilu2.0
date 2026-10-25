@@ -1,0 +1,111 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      PGHOST: localhost
+      PGPORT: "5432"
+      PGPASSWORD: postgres
+      DATABASE_URL_PY: host=localhost port=5432 user=postgres password=postgres dbname=fu
+      DATABASE_URL_JS: postgres://postgres:postgres@localhost:5432/fu
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install FFmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg fonts-dejavu-core postgresql-client
+
+      - name: Create the database (Supabase stand-ins + schema + sample data)
+        run: dev/reset_db.sh
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - name: Worker tests (fact check + full pipeline with a fake Claude)
+        working-directory: worker
+        run: |
+          pip install -r requirements.txt
+          DATABASE_URL="$DATABASE_URL_PY" python -m unittest discover -s tests -v
+
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: Web typecheck and build
+        working-directory: web
+        run: |
+          npm install
+          npm run typecheck
+          npm run build
+
+      - name: End-to-end test (reader -> AI -> editor -> reader)
+        working-directory: web
+        run: |
+          ../dev/reset_db.sh
+          npx playwright install --with-deps chromium > /dev/null
+          (cd ../worker && DATABASE_URL="$DATABASE_URL_PY" WORKER_TOKEN=ci MEDIA_DIR=/tmp/media PUBLIC_BASE_URL=http://localhost:8000 nohup python ../dev/fake_ai.py > /tmp/worker.log 2>&1 &)
+          DATABASE_URL="$DATABASE_URL_JS" NEWSROOM_PASSWORD=kaleva WORKER_URL=http://localhost:8000 WORKER_TOKEN=ci nohup npm start > /tmp/web.log 2>&1 &
+          for i in $(seq 1 60); do curl -sf http://localhost:3000/api/teams > /dev/null && curl -sf http://localhost:8000/health > /dev/null && break; sleep 2; done
+          # On failure, show the output as annotations (readable without downloading logs).
+          if ! NEWSROOM_PASSWORD=kaleva npx playwright test --reporter=line > /tmp/pw.log 2>&1; then
+            tail -n 60 /tmp/pw.log | sed 's/^/::error title=playwright::/'
+            tail -n 25 /tmp/web.log | sed 's/^/::error title=web::/'
+            tail -n 25 /tmp/worker.log | sed 's/^/::error title=worker::/'
+            exit 1
+          fi
+          tail -n 5 /tmp/pw.log
+
+  docker-compose:
+    # Checks the one-command local setup (docker compose up) really starts.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the stack
+        run: docker compose up -d --build
+      - name: Smoke test
+        run: |
+          for i in $(seq 1 90); do curl -sf http://localhost:3000/api/teams > /tmp/teams.json && curl -sf http://localhost:8000/health > /tmp/health.json && break; sleep 2; done
+          cat /tmp/health.json; grep -q Kärpät /tmp/teams.json
+          code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3000/newsroom); test "$code" = 200
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --tail 40 | sed 's/^/::error::/'
+
+  app2:
+    # React + TypeScript client and Node.js API (Appwrite version).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: "20" }
+      - name: Server typecheck and build
+        working-directory: app2/server
+        run: |
+          npm install
+          npm run typecheck
+          npm run build
+      - name: Client typecheck and build
+        working-directory: app2/client
+        run: |
+          npm install
+          npm run build
+      - name: Smoke test (one-port production mode, no Appwrite keys)
+        working-directory: app2/server
+        run: |
+          nohup npm start > /tmp/app2.log 2>&1 &
+          for i in $(seq 1 30); do curl -sf http://localhost:4000/api/health > /tmp/health.json && break; sleep 1; done
+          cat /tmp/health.json
+          curl -sf http://localhost:4000/api/data | grep -q Kärpät
+          curl -sf http://localhost:4000/ | grep -q '<div id="root">'
+      - name: Show server log on failure
+        if: failure()
+        run: tail -n 40 /tmp/app2.log | sed 's/^/::error title=app2::/'
